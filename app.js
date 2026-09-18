@@ -11,6 +11,13 @@ function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x
 const DAY_ORDER = ['sat', 'sun', 'mon', 'tue', 'wed', 'thu', 'fri'];
 const DAY_LABEL = { sat: 'السبت', sun: 'الأحد', mon: 'الاثنين', tue: 'الثلاثاء', wed: 'الأربعاء', thu: 'الخميس', fri: 'الجمعة' };
 const DAY_LABEL_SHORT = { sat: 'سبت', sun: 'أحد', mon: 'اثنين', tue: 'ثلاثاء', wed: 'أربعاء', thu: 'خميس', fri: 'جمعة' };
+const ARABIC_MONTHS = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];
+function formatArabicDate(dateKeyStr) {
+  const [y, m, d] = dateKeyStr.split('-').map(Number);
+  const dt = new Date(y, m - 1, d);
+  const weekdayKey = jsDayToKey(dt.getDay());
+  return `${DAY_LABEL[weekdayKey]} ${d} ${ARABIC_MONTHS[m - 1]}`;
+}
 function jsDayToKey(jsDay) { // JS: 0=Sun..6=Sat  -> our keys
   return ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'][jsDay];
 }
@@ -64,6 +71,8 @@ function defaultState() {
     xp: 0,
     tasks: [],           // {id, date(key), subject, title, time, duration, priority, done}
     logs: {},            // dateKey -> { minutes, sessions }
+    subjectLogs: {},      // dateKey -> { subject: minutes }
+    weeklyReviewStatus: {}, // weekKey(saturday date) -> { subject: 'done'|'needs' }
     schedule: defaultSchedule(),
     gymLast: null,        // dateKey of last gym day
     books: defaultBooks(),
@@ -112,13 +121,39 @@ function saveState() {
 /* ---------- study days / streak ---------- */
 function logMinutes(minutes, subject) {
   const k = todayKey();
+  const beforeTotal = totalMinutes(k);
   if (!state.logs[k]) state.logs[k] = { minutes: 0, sessions: 0 };
   state.logs[k].minutes += minutes;
   state.logs[k].sessions += 1;
+  const subj = subject || 'عام';
+  if (!state.subjectLogs[k]) state.subjectLogs[k] = {};
+  state.subjectLogs[k][subj] = (state.subjectLogs[k][subj] || 0) + minutes;
   const prevXp = state.xp;
   state.xp += Math.round(minutes); // 1 XP per minute, tasks/exams add more elsewhere
   saveState();
   checkLevelUp(prevXp, state.xp);
+  // daily goal celebration (fires once, the moment the crossing happens)
+  const afterTotal = totalMinutes(k);
+  if (beforeTotal < state.dailyGoalMinutes && afterTotal >= state.dailyGoalMinutes) {
+    toast('🎉 حققت هدفك اليومي في المذاكرة! استمر كده يا إبراهيم', 3600);
+    sendLocalNotification('🎉 حققت هدفك اليومي!', `ذاكرت ${afterTotal} دقيقة النهارده — إنجاز رائع نحو الصيدلة 💊`);
+  }
+}
+function subjectTotalsAllTime() {
+  const totals = {};
+  Object.values(state.subjectLogs).forEach(dayMap => {
+    Object.entries(dayMap).forEach(([subj, mins]) => { totals[subj] = (totals[subj] || 0) + mins; });
+  });
+  return totals;
+}
+function subjectTotalsForDates(dateKeys) {
+  const totals = {};
+  dateKeys.forEach(k => {
+    const dayMap = state.subjectLogs[k];
+    if (!dayMap) return;
+    Object.entries(dayMap).forEach(([subj, mins]) => { totals[subj] = (totals[subj] || 0) + mins; });
+  });
+  return totals;
 }
 function totalMinutes(dateKeyStr) { return (state.logs[dateKeyStr] || { minutes: 0 }).minutes; }
 function todayTotalMinutes() { return totalMinutes(todayKey()); }
@@ -156,6 +191,30 @@ function dayIndex() {
 }
 function studyDaysCount() { return Object.values(state.logs).filter(v => v.minutes > 0).length; }
 
+/* ---------- weekly review (Sat→Fri week, recurring automatically) ---------- */
+function currentWeekSaturday() {
+  const d = new Date();
+  const day = d.getDay(); // 0=Sun..6=Sat
+  const diff = (day - 6 + 7) % 7; // days since most recent Saturday
+  const sat = new Date(d);
+  sat.setDate(d.getDate() - diff);
+  sat.setHours(0, 0, 0, 0);
+  return sat;
+}
+function currentWeekKey() { return dateKey(currentWeekSaturday()); }
+function currentWeekDateKeys() {
+  const sat = currentWeekSaturday();
+  const keys = [];
+  for (let i = 0; i < 7; i++) { const d = new Date(sat); d.setDate(sat.getDate() + i); keys.push(dateKey(d)); }
+  return keys;
+}
+function setWeeklyReviewStatus(subject, status) {
+  const wk = currentWeekKey();
+  if (!state.weeklyReviewStatus[wk]) state.weeklyReviewStatus[wk] = {};
+  state.weeklyReviewStatus[wk][subject] = status;
+  saveState();
+}
+
 /* ---------- gym (يوم نعم يوم لا) ---------- */
 function isGymDayToday() {
   if (!state.gymLast) return null;
@@ -183,14 +242,31 @@ const MOTIVATIONS = [
   'أنت لا تذاكر من أجل الامتحان فقط، أنت تبني مستقبلك.',
   'ساعة تركيز أفضل من ساعات من التشتت.',
   'أنت لا تحتاج إلى يوم مثالي، فقط جلسة واحدة. ابدأ بها.',
+  'كل صفحة تذاكرها هي خطوة فعلية نحو كلية الصيدلة.',
+  'التفوق مش لحظة، هو تراكم أيام زي النهارده.',
+  'ابدأ بـ 10 دقايق، وهتلاقي نفسك كمّلت الساعة.',
+  'الفرق بينك وبين اللي حققوا حلمهم هو الاستمرارية بس.',
+  'مفيش وقت ضايع في المذاكرة، كله بيتحسب ليك.',
+  'ركّز في اللي قدامك دلوقتي، الباقي هيتظبط خطوة خطوة.',
+  'إنت أقوى من أي كسل بييجيلك دلوقتي.',
+  'كل مرة تقاوم فيها المشتتات، إنت بتربح.',
+  'حلم الصيدلة مش بعيد، هو على بعد ساعات مذاكرة بس.',
+  'النجاح بيحب الناس اللي بتكمل حتى لما محدش شايفها.',
+  'خد نفس عميق، وابدأ الجلسة دي — إنت جاهز.',
+  'يوم من غير مذاكرة أسهل، لكن يوم فيه مذاكرة أقرب لهدفك.',
+  'الطريق للصيدلة بيتبني بمذاكرتك النهارده، مش بكرة.',
+  'إنت بتكتب قصة نجاحك بكل ساعة تركيز هنا.',
 ];
 function motivationForToday() {
   const k = todayKey();
   if (state.lastMotivationDate === k && state.lastMotivationIndex >= 0) {
     return MOTIVATIONS[state.lastMotivationIndex];
   }
-  let idx = Math.floor(Math.random() * MOTIVATIONS.length);
-  if (idx === state.lastMotivationIndex) idx = (idx + 1) % MOTIVATIONS.length;
+  // deterministic daily rotation (not random) so every message gets its fair turn
+  // in sequence before repeating — day count since epoch, so it's stable and
+  // independent of how often the app happens to be opened.
+  const dayCount = Math.floor(Date.now() / 86400000);
+  const idx = dayCount % MOTIVATIONS.length;
   state.lastMotivationIndex = idx;
   state.lastMotivationDate = k;
   saveState();
@@ -204,17 +280,30 @@ function encouragementFor(kind, payload) {
   return '';
 }
 
-/* ===================== XP levels & titles ===================== */
-const LEVELS = [
-  { level: 1, title: 'بذرة الطموح', xp: 0 },
-  { level: 2, title: 'طالب مجتهد', xp: 100 },
-  { level: 3, title: 'باحث عن التفوق', xp: 300 },
-  { level: 4, title: 'متمكن من موادك', xp: 600 },
-  { level: 5, title: 'مستعد للتفوق', xp: 1000 },
-  { level: 6, title: 'على أعتاب الصيدلة 🎓', xp: 1500 },
-  { level: 7, title: 'صيدلي المستقبل 💊', xp: 2200 },
-  { level: 8, title: 'أسطورة المذاكرة 🏆', xp: 3200 },
-];
+/* ===================== XP levels & titles (100 levels) ===================== */
+function generateLevels() {
+  const tiers = [
+    { from: 1, title: 'بذرة الطموح 🌰' },
+    { from: 10, title: 'طالب مجتهد 📖' },
+    { from: 20, title: 'باحث عن التفوق 🔍' },
+    { from: 30, title: 'متمكن من موادك 💪' },
+    { from: 40, title: 'مستعد للتفوق 🚀' },
+    { from: 50, title: 'على أعتاب الصيدلة 🎓' },
+    { from: 60, title: 'صيدلي المستقبل 💊' },
+    { from: 75, title: 'نجم المذاكرة ⭐' },
+    { from: 90, title: 'أسطورة المذاكرة 🏆' },
+    { from: 100, title: 'أسطورة الصيدلة الكبرى 👑' },
+  ];
+  const levels = [];
+  for (let n = 1; n <= 100; n++) {
+    let title = tiers[0].title;
+    for (const t of tiers) if (n >= t.from) title = t.title;
+    const xp = n === 1 ? 0 : Math.round(30 * Math.pow(n, 1.7));
+    levels.push({ level: n, title, xp });
+  }
+  return levels;
+}
+const LEVELS = generateLevels();
 function levelInfo(xp) {
   let current = LEVELS[0];
   let next = LEVELS[1] || null;
@@ -399,7 +488,59 @@ function scheduleLessonReminders() {
     }
   });
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleLessonReminders(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { scheduleLessonReminders(); scheduleDailyNotifications(); } });
+
+/* ===================== Daily notifications (study nudge, reviews due, Friday exam) =====================
+   Same honest limitation as lesson reminders: these fire via setTimeout while the app/tab is open in
+   the background, and are rescheduled every time the app is opened or resumed. Android can still
+   suspend them if the app has been fully closed for a long time — this is a real platform limit. */
+let dailyNotifTimeouts = [];
+function clearDailyNotifications() {
+  dailyNotifTimeouts.forEach(h => clearTimeout(h));
+  dailyNotifTimeouts = [];
+}
+function msUntilTodayAt(hour, minute) {
+  const t = new Date();
+  t.setHours(hour, minute, 0, 0);
+  return t.getTime() - Date.now();
+}
+function scheduleDailyNotifications() {
+  clearDailyNotifications();
+  if (!state.settings.notifications) return;
+  // 0) daily motivational message, sent once every morning at 9 AM
+  const motivationMs = msUntilTodayAt(9, 0);
+  if (motivationMs > 0) {
+    dailyNotifTimeouts.push(setTimeout(() => {
+      sendLocalNotification('☀️ رسالتك اليوم', motivationForToday());
+    }, motivationMs));
+  }
+  // 1) "haven't studied yet today" nudge at 8 PM
+  const studyMs = msUntilTodayAt(20, 0);
+  if (studyMs > 0) {
+    dailyNotifTimeouts.push(setTimeout(() => {
+      if (todayTotalMinutes() === 0) {
+        sendLocalNotification('لسه ما ذاكرتش النهارده 👀', 'مش لازم يوم مثالي — ابدأ بـ 25 دقيقة بس وشوف الفرق.');
+      }
+    }, studyMs));
+  }
+  // 2) reviews due today, reminder at 5 PM
+  const reviewMs = msUntilTodayAt(17, 0);
+  if (reviewMs > 0) {
+    dailyNotifTimeouts.push(setTimeout(() => {
+      const n = todaysReviews().length;
+      if (n > 0) sendLocalNotification('🧠 عندك مراجعات مستحقة', `${n} مراجعة متباعدة مستنياك النهارده — 20 دقيقة وتثبتها.`);
+    }, reviewMs));
+  }
+  // 3) Friday weekly exam + review reminder at 10 AM
+  if (jsDayToKey(new Date().getDay()) === 'fri') {
+    const fridayMs = msUntilTodayAt(10, 0);
+    if (fridayMs > 0) {
+      dailyNotifTimeouts.push(setTimeout(() => {
+        sendLocalNotification('📝 الجمعة يوم المراجعة والامتحان', 'راجع مواد الأسبوع من "مراجعة الأسبوع" ثم اختبر نفسك في الامتحان الأسبوعي.');
+      }, fridayMs));
+    }
+  }
+}
 
 async function requestNotificationPermission() {
   if (!('Notification' in window)) { toast('الإشعارات غير مدعومة على هذا المتصفح'); return; }
@@ -428,8 +569,17 @@ function toggleTask(id) {
   if (t.done) {
     const prevXp = state.xp;
     state.xp += 5;
-    toast(encouragementFor('task'));
     checkLevelUp(prevXp, state.xp);
+    // if this is an auto lesson-study task (not gym, not itself a review), schedule spaced reviews
+    if (t.auto && t.subject && t.subject !== 'الجيم' && !t.reviewId && !t.reviewsCreated) {
+      const lessonName = t.title.replace(/^مذاكرة\s*/, '');
+      const created = createSpacedReviewsForLesson(t.subject, lessonName);
+      t.reviewsCreated = true;
+      const nextDate = created[0];
+      toast(`📅 هتراجع ${t.subject} تاني يوم ${formatArabicDate(nextDate.dueDate)}`, 3600);
+    } else {
+      toast(encouragementFor('task'));
+    }
   }
   saveState();
   render();
@@ -467,15 +617,26 @@ function ensureTodayAutoTasks() {
 /* ===================== Spaced repetition ===================== */
 function createSpacedReviewsForLesson(subject, lessonName) {
   const base = new Date();
+  const created = [];
   state.settings.reviewIntervalsDays.forEach(days => {
     const d = new Date(base); d.setDate(d.getDate() + days);
-    state.spacedReviews.push({ id: uid(), subject, lessonName, dueDate: dateKey(d), done: false });
+    const review = { id: uid(), subject, lessonName, dueDate: dateKey(d), done: false };
+    state.spacedReviews.push(review);
+    created.push(review);
   });
   saveState();
+  return created;
 }
 function todaysReviews() {
   const k = todayKey();
   return state.spacedReviews.filter(r => r.dueDate === k && !r.done);
+}
+function upcomingReviews(limit = 8) {
+  const k = todayKey();
+  return state.spacedReviews
+    .filter(r => !r.done && r.dueDate >= k)
+    .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+    .slice(0, limit);
 }
 function completeReview(id) {
   const r = state.spacedReviews.find(x => x.id === id);
@@ -571,6 +732,7 @@ async function deletePdfBlob(bookId) {
 /* ===================== Navigation / render ===================== */
 let activeTab = 'home';
 let scheduleActiveDay = jsDayToKey(new Date().getDay());
+let scheduleView = 'days'; // 'days' | 'weeklyreview'
 let examFlow = null; // {questions, index, answers, subject}
 
 function switchTab(tab) { activeTab = tab; render(); window.scrollTo(0, 0); }
@@ -729,6 +891,7 @@ function escapeHtml(str) {
 
 /* ---------------- SCHEDULE ---------------- */
 function renderSchedule() {
+  if (scheduleView === 'weeklyreview') return renderWeeklyReview();
   const gym = isGymDayToday();
   const gymText = gym === 'gym' ? 'اليوم يوم جيم 🏋️' : gym === 'today-was-gym' ? 'ذهبت للجيم اليوم بالفعل ✅' : gym === 'rest' ? 'اليوم يوم راحة' : 'حدّد آخر يوم جيم من الإعدادات';
   const lessons = state.schedule[scheduleActiveDay] || [];
@@ -772,10 +935,62 @@ function renderSchedule() {
       <button class="link-btn" id="setGymBtn">تحديث</button>
     </div>
 
-    <div class="card" style="background:var(--purple);">
+    <div class="card" style="background:var(--purple);cursor:pointer;" id="openWeeklyReviewBtn">
       <p style="margin:0;font-weight:800;font-size:14px;">الجمعة = مراجعة وامتحان</p>
       <p style="margin:6px 0 0;font-size:12.5px;color:var(--ink);opacity:.75;">راجع كل ما أخذته خلال الأسبوع ثم اختبر نفسك قبل أسبوع جديد.</p>
+      <p style="margin:8px 0 0;font-size:12.5px;color:var(--green-deep);font-weight:800;">افتح مراجعة هذا الأسبوع ←</p>
     </div>
+
+    <div class="section-head"><p class="section-title" style="font-size:16px;">مراجعاتك القادمة 🧠</p></div>
+    ${upcomingReviews().length === 0 ? `<div class="empty-state"><span class="em-icon">📅</span>خلّص مهمة "مذاكرة" من مهام اليوم وهتظهرلك هنا مواعيد مراجعتها تلقائيًا.</div>` :
+      upcomingReviews().map(r => `
+      <div class="lesson-row" style="border-inline-start-color:var(--coral);">
+        <div class="lesson-body">
+          <p class="lesson-name">${escapeHtml(r.lessonName)}${r.lessonName !== r.subject ? ` <span style="color:var(--muted);font-weight:600;">— ${escapeHtml(r.subject)}</span>` : ''}</p>
+          <p class="lesson-time">${r.dueDate === todayKey() ? '📌 مستحقة اليوم' : formatArabicDate(r.dueDate)}</p>
+        </div>
+      </div>`).join('')}
+  </div>`;
+}
+
+function renderWeeklyReview() {
+  const wk = currentWeekKey();
+  const dateKeys = currentWeekDateKeys();
+  const totals = subjectTotalsForDates(dateKeys);
+  const statusMap = state.weeklyReviewStatus[wk] || {};
+  const weekStart = currentWeekSaturday();
+  const weekEnd = new Date(weekStart); weekEnd.setDate(weekStart.getDate() + 6);
+  const rangeLabel = `${weekStart.getDate()} ${ARABIC_MONTHS[weekStart.getMonth()]} — ${weekEnd.getDate()} ${ARABIC_MONTHS[weekEnd.getMonth()]}`;
+  return `
+  <div class="screen">
+    <div class="topbar">
+      <div>
+        <button class="link-btn" id="backToScheduleBtn" style="padding:0;margin-bottom:6px;">← رجوع للجدول</button>
+        <p class="section-title" style="margin:0;font-size:22px;">مراجعة الأسبوع</p>
+        <p style="margin:4px 0 0;font-size:12.5px;color:var(--muted);">${rangeLabel}</p>
+      </div>
+    </div>
+
+    <div class="card card-navy" style="padding:16px;">
+      <p style="margin:0 0 6px;font-weight:800;">راجع كل مادة أخذتها الأسبوع ده</p>
+      <p style="margin:0;font-size:12.5px;opacity:.8;">حدد لكل مادة "تمت المراجعة" أو "تحتاج مراجعة إضافية"، وده بيتجدد تلقائيًا كل أسبوع.</p>
+    </div>
+
+    ${SUBJECTS.map(subj => {
+      const mins = totals[subj] || 0;
+      const status = statusMap[subj]; // 'done' | 'needs' | undefined
+      return `
+      <div class="card" style="padding:14px 16px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+          <p style="margin:0;font-weight:800;font-size:15px;">${subj}</p>
+          <span style="font-size:12px;color:var(--muted);">${mins > 0 ? fmtMinutesLabel(mins) + ' هذا الأسبوع' : 'لسه ما ذاكرتش الأسبوع ده'}</span>
+        </div>
+        <div class="chip-row" style="margin-bottom:0;">
+          <span class="chip ${status === 'done' ? 'active' : ''}" data-review-status="done" data-review-subject="${subj}">✅ تمت المراجعة</span>
+          <span class="chip ${status === 'needs' ? 'active navy' : ''}" data-review-status="needs" data-review-subject="${subj}">🔁 تحتاج مراجعة إضافية</span>
+        </div>
+      </div>`;
+    }).join('')}
   </div>`;
 }
 
@@ -809,11 +1024,13 @@ function renderExamBuilder() {
     <label>عدد الأسئلة</label>
     <div class="chip-row" id="countChips">
       ${[3, 5, 10].map(c => `<span class="chip ${examBuilder.count === c ? 'active navy' : ''}" data-count="${c}">${c} سؤال</span>`).join('')}
+      <span class="chip ${![3, 5, 10].includes(examBuilder.count) ? 'active navy' : ''}" data-count="custom">مخصص${![3, 5, 10].includes(examBuilder.count) ? ` (${examBuilder.count})` : ''}</span>
     </div>
 
     <label>مدة الامتحان</label>
     <div class="chip-row" id="durChips">
       ${[5, 10, 20].map(c => `<span class="chip ${examBuilder.duration === c ? 'active navy' : ''}" data-examdur="${c}">${c} دقيقة</span>`).join('')}
+      <span class="chip ${![5, 10, 20].includes(examBuilder.duration) ? 'active navy' : ''}" data-examdur="custom">مخصص${![5, 10, 20].includes(examBuilder.duration) ? ` (${examBuilder.duration})` : ''}</span>
     </div>
 
     <p style="font-size:12px;color:var(--muted);margin:0 0 14px;">
@@ -1005,6 +1222,9 @@ function renderMore() {
         <span class="switch-label">🔔 الإشعارات</span>
         <div class="switch ${s.notifications ? 'on' : ''}" id="notifSwitch"><div class="knob"></div></div>
       </div>
+      <p style="font-size:11px;color:var(--muted);margin:6px 2px 0;line-height:1.7;">
+        بتشمل: رسالة تحفيزية كل صباح الساعة 9، تذكير قبل كل حصة، تذكير لو لسه ما ذاكرتش الساعة 8 بالليل، تذكير بالمراجعات المستحقة الساعة 5، تذكير امتحان الجمعة الساعة 10 صباحًا، وتهنئة عند تحقيق هدفك اليومي.
+      </p>
       <p style="font-size:11.5px;color:var(--muted);margin:8px 2px 0;line-height:1.7;">
         ملاحظة: الإشعارات تصلك محليًا طالما الجهاز يبقي التطبيق يعمل في الخلفية. أندرويد قد يوقف ذلك بعد إغلاق التطبيق تمامًا لفترة طويلة — هذا قيد حقيقي لأي تطبيق ويب وليس خطأ.
       </p>
@@ -1103,14 +1323,48 @@ function bindScreenEvents() {
   $$('[data-edit-lesson]').forEach(el => el.addEventListener('click', () => openLessonSheet(el.dataset.editLesson)));
   $$('[data-del-lesson]').forEach(el => el.addEventListener('click', () => {
     state.schedule[scheduleActiveDay] = state.schedule[scheduleActiveDay].filter(l => l.id !== el.dataset.delLesson);
-    saveState(); render(); scheduleLessonReminders();
+    saveState(); render(); scheduleLessonReminders(); scheduleDailyNotifications();
   }));
   const setGymBtn = $('#setGymBtn'); if (setGymBtn) setGymBtn.addEventListener('click', openGymSheet);
+  const openWeeklyBtn = $('#openWeeklyReviewBtn'); if (openWeeklyBtn) openWeeklyBtn.addEventListener('click', () => { scheduleView = 'weeklyreview'; render(); });
+  const backToScheduleBtn = $('#backToScheduleBtn'); if (backToScheduleBtn) backToScheduleBtn.addEventListener('click', () => { scheduleView = 'days'; render(); });
+  $$('[data-review-status]').forEach(el => el.addEventListener('click', () => {
+    setWeeklyReviewStatus(el.dataset.reviewSubject, el.dataset.reviewStatus);
+    render();
+  }));
 
   /* ---- EXAM ---- */
   $$('[data-subject]').forEach(el => el.addEventListener('click', () => { examBuilder.subject = el.dataset.subject; render(); }));
-  $$('[data-count]').forEach(el => el.addEventListener('click', () => { examBuilder.count = parseInt(el.dataset.count, 10); render(); }));
-  $$('[data-examdur]').forEach(el => el.addEventListener('click', () => { examBuilder.duration = parseInt(el.dataset.examdur, 10); render(); }));
+  $$('[data-count]').forEach(el => el.addEventListener('click', () => {
+    if (el.dataset.count === 'custom') {
+      showSheet('عدد أسئلة مخصص', `
+        <div class="field"><label>عدد الأسئلة</label><input type="number" id="customCountInput" min="1" max="100" value="${examBuilder.count}"></div>
+        <button class="btn-primary" id="customCountConfirm">تأكيد</button>
+      `, () => {
+        $('#customCountConfirm').addEventListener('click', () => {
+          const v = parseInt($('#customCountInput').value, 10);
+          if (v > 0) { examBuilder.count = v; closeSheet(); render(); }
+        });
+      });
+    } else {
+      examBuilder.count = parseInt(el.dataset.count, 10); render();
+    }
+  }));
+  $$('[data-examdur]').forEach(el => el.addEventListener('click', () => {
+    if (el.dataset.examdur === 'custom') {
+      showSheet('مدة امتحان مخصصة', `
+        <div class="field"><label>المدة بالدقائق</label><input type="number" id="customExamDurInput" min="1" max="180" value="${examBuilder.duration}"></div>
+        <button class="btn-primary" id="customExamDurConfirm">تأكيد</button>
+      `, () => {
+        $('#customExamDurConfirm').addEventListener('click', () => {
+          const v = parseInt($('#customExamDurInput').value, 10);
+          if (v > 0) { examBuilder.duration = v; closeSheet(); render(); }
+        });
+      });
+    } else {
+      examBuilder.duration = parseInt(el.dataset.examdur, 10); render();
+    }
+  }));
   const startExamBtn = $('#startExamBtn'); if (startExamBtn) startExamBtn.addEventListener('click', beginExam);
   const addQBtn = $('#addQuestionBtn'); if (addQBtn) addQBtn.addEventListener('click', openAddQuestionSheet);
   $$('[data-del-q]').forEach(el => el.addEventListener('click', () => { deleteQuestion(el.dataset.delQ); render(); }));
@@ -1158,19 +1412,19 @@ function bindScreenEvents() {
     state.settings.notifications = !state.settings.notifications;
     saveState();
     if (state.settings.notifications) await requestNotificationPermission();
-    render(); scheduleLessonReminders();
+    render(); scheduleLessonReminders(); scheduleDailyNotifications();
   });
   const lessonRemindersSwitch = $('#lessonRemindersSwitch');
   if (lessonRemindersSwitch) lessonRemindersSwitch.addEventListener('click', async () => {
     state.settings.lessonReminders = !state.settings.lessonReminders;
     saveState();
     if (state.settings.lessonReminders && state.settings.notifications) await requestNotificationPermission();
-    render(); scheduleLessonReminders();
+    render(); scheduleLessonReminders(); scheduleDailyNotifications();
   });
   const reminderMinutesInput = $('#reminderMinutesInput');
   if (reminderMinutesInput) reminderMinutesInput.addEventListener('change', () => {
     state.settings.reminderMinutesBefore = parseInt(reminderMinutesInput.value, 10) || 10;
-    saveState(); scheduleLessonReminders();
+    saveState(); scheduleLessonReminders(); scheduleDailyNotifications();
   });
   const saveGoalsBtn = $('#saveGoalsBtn');
   if (saveGoalsBtn) saveGoalsBtn.addEventListener('click', () => {
@@ -1240,7 +1494,7 @@ function openLessonSheet(lessonId) {
       if (!state.schedule[scheduleActiveDay]) state.schedule[scheduleActiveDay] = [];
       if (existing) { existing.subject = subject; existing.time = time; }
       else { state.schedule[scheduleActiveDay].push({ id: uid(), subject, time }); }
-      saveState(); closeSheet(); render(); scheduleLessonReminders();
+      saveState(); closeSheet(); render(); scheduleLessonReminders(); scheduleDailyNotifications();
     });
   });
 }
@@ -1431,9 +1685,24 @@ async function triggerInstall() {
 }
 
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => { navigator.serviceWorker.register('sw.js').catch(() => {}); });
+  window.addEventListener('load', async () => {
+    try {
+      // Belt-and-suspenders: unregister whatever SW is currently controlling this
+      // page and wipe old caches before re-registering fresh. This guarantees a
+      // clean state every load instead of depending on the browser noticing the
+      // sw.js file changed, which is what caused the earlier "stuck on an old
+      // version forever" bug.
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+      if (window.caches) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+      }
+      await navigator.serviceWorker.register('sw.js');
+    } catch (e) { /* ignore — app works fine without a service worker too */ }
+  });
 }
 
 applyDarkMode();
 render();
-scheduleLessonReminders();
+scheduleLessonReminders(); scheduleDailyNotifications();

@@ -1,4 +1,4 @@
-const CACHE = 'ibrahim-focus-v1';
+const CACHE = 'ibrahim-focus-v2';
 const ASSETS = ['./index.html','./app.js','./manifest.json','./icon-192.png','./icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -13,9 +13,18 @@ self.addEventListener('activate', (e) => {
   self.clients.claim();
 });
 
+// Network-first: always try to fetch the latest version when online (and quietly
+// refresh the cache), and only fall back to the cached copy when offline. The old
+// version of this file was cache-first, which meant once a phone cached the app it
+// would keep serving that exact snapshot forever and never notice updates — that
+// was the real bug behind "the update isn't showing up". This fixes it going forward.
 self.addEventListener('fetch', (e) => {
   e.respondWith(
-    caches.match(e.request).then(cached => cached || fetch(e.request).catch(() => cached))
+    fetch(e.request).then(resp => {
+      const copy = resp.clone();
+      caches.open(CACHE).then(c => c.put(e.request, copy));
+      return resp;
+    }).catch(() => caches.match(e.request))
   );
 });
 
